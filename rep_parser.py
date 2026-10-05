@@ -3,7 +3,7 @@
 from pathlib import Path
 
 _HEADER_BYTES = 128
-_BYTES_PER_FRAME = 2
+_BYTES_PER_FRAME = 4   # 1 フレームにつき 2 人分 × 2 バイトの入力
 _FPS = 60
 _BUFFER_SECONDS = 90  # リプレイ終了後の余裕（結果画面表示分や、推測精度のブレ吸収も含む）
 
@@ -29,4 +29,6 @@ def auto_stop_duration(rep_path: str) -> float | None:
     d = estimate_duration(rep_path)
     if d is None:
         return None
-    return d + _BUFFER_SECONDS
+    # 通常はゲームの画面状態からリプレイ終了を検出して止める。こちらはそれが効かない
+    # 場合の打ち切り時間なので、推定が外れても途中で切れないよう 2 倍の余裕を取る。
+    return d * 2 + _BUFFER_SECONDS

@@ -34,11 +34,15 @@ def _guid(s: str) -> _GUID:
 _CLSID_MMDeviceEnum    = _guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
 _IID_IMMDeviceEnum     = _guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
 # PolicyConfig: Win10/11 用を先に試し、失敗時は Vista 互換版にフォールバック
+# (CLSID, IID, SetDefaultEndpoint の vtable 位置)。
+# vtable 位置はインターフェースごとに違う: IPolicyConfig は IUnknown の 3 つの後に
+# GetMixFormat ... SetPropertyValue の 10 メソッドが並び SetDefaultEndpoint は 13 番目、
+# IPolicyConfigVista は ResetDeviceFormat が無いぶん 1 つ手前の 12 番目。
 _POLICY_PAIRS = [
     (_guid("{870AF99C-171D-4F9E-AF0D-E63DF40C2BC9}"),
-     _guid("{F8679F50-850A-41CF-9C72-430F290290C8}")),   # Win10+
+     _guid("{F8679F50-850A-41CF-9C72-430F290290C8}"), 13),   # Win10+
     (_guid("{294935CE-F637-4E7C-A41B-AB255460B862}"),
-     _guid("{568b9108-44bf-40b4-9006-86afe5b5a620}")),   # Vista 互換 (Win7-11 でも動作)
+     _guid("{568b9108-44bf-40b4-9006-86afe5b5a620}"), 12),   # Vista 互換 (Win7-11 でも動作)
 ]
 _IID_IPropertyStore = _guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
 
@@ -180,13 +184,12 @@ def get_default_playback_device_id() -> str | None:
 
 def set_default_playback_device(device_id: str) -> bool:
     """既定再生デバイスを変更する (Console/Multimedia/Communications の全ロール)。"""
-    for clsid, iid in _POLICY_PAIRS:
+    for clsid, iid, index in _POLICY_PAIRS:
         pc = _create(clsid, iid)
         if not pc:
             continue
         try:
-            # SetDefaultEndpoint (vtable[7])
-            SetDefault = _vtbl(pc, 7, ctypes.HRESULT,
+            SetDefault = _vtbl(pc, index, ctypes.HRESULT,
                                ctypes.c_wchar_p, ctypes.c_uint)
             ok = all(SetDefault(pc, device_id, role) == 0 for role in (0, 1, 2))
             if ok:
@@ -222,22 +225,29 @@ def find_vbcable() -> tuple[str, str] | None:
     return None
 
 
-def find_vbcable_loopback_name() -> str | None:
+def find_vbcable_loopback_name(render_name: str | None = None) -> str | None:
     """
     pyaudiowpatch のループバック一覧に現れる VB-Cable のデバイス名を返す。
     recorder.WASAPI_PREFIX が付いた形式。
+    render_name (find_vbcable が返した再生デバイス名) を渡すと、そのデバイスの
+    ループバックを優先する。VB-Cable は複数の再生デバイスを持つことがあり、
+    音を流した先と別のデバイスを録ると無音になる。
     """
     try:
         import pyaudiowpatch as pyaudio
         from recorder import WASAPI_PREFIX
         pa = pyaudio.PyAudio()
         try:
-            for info in pa.get_loopback_device_info_generator():
-                name = info.get("name", "")
-                if any(kw in name for kw in _VBCABLE_KEYWORDS):
-                    return f"{WASAPI_PREFIX}{name}"
+            names = [info.get("name", "") for info in pa.get_loopback_device_info_generator()]
         finally:
             pa.terminate()
+        if render_name:
+            for name in names:
+                if name.startswith(render_name):
+                    return f"{WASAPI_PREFIX}{name}"
+        for name in names:
+            if any(kw in name for kw in _VBCABLE_KEYWORDS):
+                return f"{WASAPI_PREFIX}{name}"
     except Exception:
         pass
     return None

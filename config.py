@@ -1,7 +1,18 @@
 import json
+import os
+import sys
 from pathlib import Path
 
-CONFIG_FILE = Path(__file__).parent / "config.json"
+_LOCAL_FILE = Path(__file__).parent / "config.json"
+
+if getattr(sys, "frozen", False):
+    # exe 版: _internal/ の中はビルドや更新のたびに作り直されて設定が消えるので、
+    # ユーザーごとの %APPDATA% に保存する。
+    CONFIG_FILE = Path(os.environ.get("APPDATA") or Path.home()) / "SokuReplayRecorder" / "config.json"
+    _LEGACY_FILE = _LOCAL_FILE   # 旧バージョンの保存先 (初回だけ引き継ぐ)
+else:
+    CONFIG_FILE = _LOCAL_FILE
+    _LEGACY_FILE = None
 
 DEFAULT_CONFIG = {
     "th123_path": "",
@@ -21,9 +32,14 @@ DEFAULT_CONFIG = {
 
 
 def load() -> dict:
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+    for path in (CONFIG_FILE, _LEGACY_FILE):
+        if path is None or not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
         return cfg
@@ -31,5 +47,6 @@ def load() -> dict:
 
 
 def save(cfg: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)

@@ -21,7 +21,7 @@ except ImportError:
     _DND_AVAILABLE = False
 
 APP_TITLE = "非想天則 リプレイ録画ツール"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 WIDTH, HEIGHT = 620, 920
 
 ctk.set_appearance_mode("dark")
@@ -36,6 +36,8 @@ try:
         _font_cfg["family"] = "Yu Gothic UI"
 except Exception:
     pass
+
+_INVALID_NAME_CHARS = '\\/:*?"<>|'
 
 _PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 
@@ -52,6 +54,7 @@ class RecordSession:
         self._stop_event = threading.Event()
         self._recorder = rec_mod.Recorder(log=self._log)
         self._game_proc = None
+        self._prev_default_device: str | None = None   # ゲーム音のみモードで退避した既定デバイス
 
     def _log(self, msg: str) -> None:
         self.log_q.put(msg)
@@ -90,20 +93,21 @@ class RecordSession:
             self._log("リプレイ時間を推定できませんでした (手動停止してください)")
 
         # ── ゲーム音のみモード: 起動前に VB-Cable を既定デバイスに一時変更 ──
-        _prev_default_device: str | None = None
         _routing_ok = False
+        _vb_name: str | None = None
         if cfg.get("game_audio_only", False):
             try:
                 import audio_routing
                 vb = audio_routing.find_vbcable()
                 if vb:
-                    _prev_default_device = audio_routing.get_default_playback_device_id()
+                    self._prev_default_device = audio_routing.get_default_playback_device_id()
                     if audio_routing.set_default_playback_device(vb[1]):
                         _routing_ok = True
+                        _vb_name = vb[0]
                         self._log(f"[ゲーム音のみ] 既定デバイスを「{vb[0]}」に変更しました")
                     else:
                         self._log("[警告] 既定デバイスの変更に失敗しました (通常ルーティングで続行)")
-                        _prev_default_device = None
+                        self._prev_default_device = None
                 else:
                     self._log("[警告] VB-Cable が見つかりません (通常ルーティングで続行)")
                     self._log("  → https://vb-audio.com/Cable/ からインストールしてください")
@@ -111,20 +115,15 @@ class RecordSession:
                 self._log(f"[警告] ゲーム音ルーティング失敗: {e}")
 
         self._log("th123.EXE を起動しています...")
-        self._game_proc = game.launch_game(cfg["th123_path"])
+        try:
+            self._game_proc = game.launch_game(cfg["th123_path"])
+            hwnd = game.wait_for_window(self._game_proc.pid, timeout=30, log=self._log)
+        finally:
+            # 起動後すぐに既定デバイスを元に戻す（th123 はすでに VB-Cable を掴んでいる）。
+            # 起動に失敗した場合も必ず戻す。
+            self._restore_default_device()
 
-        hwnd = game.wait_for_window(self._game_proc.pid, timeout=30, log=self._log)
-
-        # 起動後すぐに既定デバイスを元に戻す（th123 はすでに VB-Cable を掴んでいる）
-        if _prev_default_device:
-            try:
-                import audio_routing
-                if audio_routing.set_default_playback_device(_prev_default_device):
-                    self._log("[ゲーム音のみ] 既定デバイスを元に戻しました")
-                else:
-                    self._log("[警告] 既定デバイスの復元に失敗しました")
-            except Exception as e:
-                self._log(f"[警告] デバイス復元エラー: {e}")
+        game.disable_rounded_corners(hwnd)
 
         # ゲームウィンドウの位置をメインスレッドに通知 → ツールウィンドウを隣に移動
         import win32gui as _wg
@@ -185,7 +184,7 @@ class RecordSession:
         if cfg.get("game_audio_only", False) and _routing_ok:
             try:
                 import audio_routing
-                vb_lb = audio_routing.find_vbcable_loopback_name()
+                vb_lb = audio_routing.find_vbcable_loopback_name(_vb_name)
                 if vb_lb:
                     audio_dev = vb_lb
                     self._log(f"[ゲーム音のみ] 音声キャプチャ: {vb_lb}")
@@ -266,7 +265,21 @@ class RecordSession:
                 _next_notice = now + 60.0
             time.sleep(0.1)
 
+    def _restore_default_device(self) -> None:
+        prev, self._prev_default_device = self._prev_default_device, None
+        if not prev:
+            return
+        try:
+            import audio_routing
+            if audio_routing.set_default_playback_device(prev):
+                self._log("[ゲーム音のみ] 既定デバイスを元に戻しました")
+            else:
+                self._log("[警告] 既定デバイスの復元に失敗しました")
+        except Exception as e:
+            self._log(f"[警告] デバイス復元エラー: {e}")
+
     def _cleanup(self) -> None:
+        self._restore_default_device()
         self._recorder.stop()
         if self._game_proc and game.is_running(self._game_proc):
             try:
@@ -307,8 +320,11 @@ class App(ctk.CTk):
         self._batch_index = 0
         self._batch_stopped = False
 
+        self._closing = False
+
         self._build_ui()
         self._poll_log()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI 構築 ──────────────────────────────
     def _build_ui(self) -> None:
@@ -420,7 +436,7 @@ class App(ctk.CTk):
         _audio_hint_row.grid(row=6, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
         ctk.CTkLabel(
             _audio_hint_row,
-            text="※ ゲーム音を録るには、再生デバイスを既定に設定した上で「ステレオ ミキサー」を有効化してください",
+            text="※ ゲーム音は既定の再生デバイスから出ます。そのデバイスの「[ループバック]」を選んでください",
             font=ctk.CTkFont(size=10),
             text_color="#e0a020",
         ).pack(side="left")
@@ -690,8 +706,10 @@ class App(ctk.CTk):
         name = template.format(
             stem=Path(rep_path).stem,
             date=datetime.now().strftime("%Y%m%d"),
-        ) + ".mp4"
-        return str(Path(cfg["output_dir"]) / name)
+        )
+        # ファイル名に使えない文字は _ に置き換える
+        name = "".join("_" if c in _INVALID_NAME_CHARS else c for c in name).strip() or Path(rep_path).stem
+        return str(Path(cfg["output_dir"]) / (name + ".mp4"))
 
     # ── 上書き確認 ───────────────────────────
     def _check_overwrites(self, cfg: dict) -> bool:
@@ -717,6 +735,14 @@ class App(ctk.CTk):
             return
         if not Path(cfg["output_dir"]).exists():
             self._log("出力フォルダが存在しません")
+            return
+        try:
+            outputs = [self._resolve_output_path(cfg, p) for p in self._rep_files]
+        except (KeyError, IndexError, ValueError):
+            self._log("ファイル名の書式が正しくありません。使えるのは {stem} と {date} だけです")
+            return
+        if len(set(o.lower() for o in outputs)) < len(outputs):
+            self._log("出力ファイル名が重複します。ファイル名に {stem} を入れるか、同名の .rep を外してください")
             return
         if not self._check_overwrites(cfg):
             return
@@ -759,6 +785,22 @@ class App(ctk.CTk):
         self._batch_stopped = True
         if self._session:
             self._session.request_stop()
+
+    def _on_close(self) -> None:
+        """
+        録画中に閉じられたら、録画を止めて後始末 (FFmpeg 停止・ゲーム終了・一時ファイル削除)
+        が終わってからウィンドウを閉じる。そのまま閉じると FFmpeg が録画し続けたまま残る。
+        """
+        if self._session is None:
+            self.destroy()
+            return
+        if self._closing:
+            return
+        if not messagebox.askyesno("終了確認", "録画中です。録画を停止して終了しますか？", parent=self):
+            return
+        self._closing = True
+        self._log("録画を停止して終了します...")
+        self._stop_recording()
 
     # ── 切り抜きウィンドウ ────────────────────
     def _open_trim_window(self, path: str) -> None:
@@ -814,18 +856,19 @@ class App(ctk.CTk):
                                 parent=self)
             return
         try:
-            import ctypes
-            import win32gui
-            cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
-            pt = ctypes.wintypes.POINT(cl, ct)
-            ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
-            left, top = pt.x, pt.y
-            width, height = cr - cl, cb - ct
-            if width <= 0 or height <= 0:
-                messagebox.showinfo("キャプチャ確認", "ゲームウィンドウのサイズを取得できませんでした。", parent=self)
+            import io
+            from PIL import Image, ImageTk
+            ffmpeg = rec_mod.find_ffmpeg()
+            png = game.grab_window_png(hwnd, ffmpeg) if ffmpeg else None
+            if not png:
+                messagebox.showinfo(
+                    "キャプチャ確認",
+                    "ゲーム画面を取得できませんでした。\nウィンドウが最小化されていないか確認してください。",
+                    parent=self,
+                )
                 return
-            from PIL import ImageGrab, ImageTk
-            img = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+            img = Image.open(io.BytesIO(png))
+            width, height = img.size
         except Exception as e:
             messagebox.showerror("キャプチャ確認", f"スクリーンショット取得に失敗しました:\n{e}", parent=self)
             return
@@ -883,6 +926,9 @@ class App(ctk.CTk):
                     self._log_box.configure(state="disabled")
         except queue.Empty:
             pass
+        if self._closing and self._session is None:
+            self.destroy()   # 録画の後始末が終わったので閉じる
+            return
         self.after(200, self._poll_log)
 
     def _move_beside_game(self, gl: int, gt: int, gr: int, gb: int) -> None:
@@ -903,24 +949,6 @@ class App(ctk.CTk):
             self.geometry(f"+{x}+{gb + 8}")
         else:                          # 収まらない場合は右端
             self.geometry(f"+{sw - mw}+0")
-
-
-def _ensure_admin() -> None:
-    import ctypes
-    if ctypes.windll.shell32.IsUserAnAdmin():
-        return
-    import sys
-    import win32com.shell.shell as shell
-    import win32com.shell.shellcon as shellcon
-    params = " ".join(f'"{a}"' for a in sys.argv)
-    shell.ShellExecuteEx(
-        fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
-        lpVerb="runas",
-        lpFile=sys.executable,
-        lpParameters=params,
-        nShow=1,
-    )
-    sys.exit()
 
 
 def _set_dpi_aware() -> None:
@@ -954,6 +982,5 @@ def _set_dpi_aware() -> None:
 
 if __name__ == "__main__":
     _set_dpi_aware()
-    _ensure_admin()
     app = App()
     app.mainloop()

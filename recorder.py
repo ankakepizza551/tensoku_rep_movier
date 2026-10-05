@@ -114,21 +114,49 @@ def find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def encoder_args(encoder: str, crf: int, preset: str) -> list[str]:
+    """エンコーダーごとの品質・速度オプション。crf は libx264 の CRF 相当の値。"""
+    if encoder == "h264_nvenc":   # NVIDIA
+        return ["-c:v", encoder, "-preset", "p1", "-rc", "vbr", "-cq", str(crf), "-gpu", "any"]
+    if encoder == "h264_amf":     # AMD (preset は balanced / speed / quality のみ)
+        return ["-c:v", encoder, "-preset", "speed", "-rc", "cqp",
+                "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf)]
+    if encoder == "h264_qsv":     # Intel
+        return ["-c:v", encoder, "-preset", "veryfast", "-global_quality", str(crf)]
+    return ["-c:v", "libx264", "-preset", preset, "-tune", "zerolatency", "-crf", str(crf)]
+
+
+_best_encoder_cache: dict[str, str] = {}
+
+
 def get_best_encoder(ffmpeg: str) -> str:
-    """利用可能な最速のエンコーダーを返す。"""
+    """
+    この PC で実際に使える最速のエンコーダーを返す。
+    ffmpeg は NVIDIA / AMD / Intel 用のエンコーダーをすべて内蔵しているので、
+    一覧に載っているかではなく、数フレーム試しにエンコードして成功したものを選ぶ
+    (対応する GPU が無いエンコーダーは起動時に失敗する)。
+    """
+    if ffmpeg in _best_encoder_cache:
+        return _best_encoder_cache[ffmpeg]
     CREATE_NO_WINDOW = 0x08000000
-    try:
-        proc = subprocess.run(
-            [ffmpeg, "-encoders"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            creationflags=CREATE_NO_WINDOW
-        )
-        if "h264_nvenc" in proc.stdout: return "h264_nvenc"  # NVIDIA
-        if "h264_amf" in proc.stdout:   return "h264_amf"    # AMD
-        if "h264_qsv" in proc.stdout:   return "h264_qsv"    # Intel
-    except Exception:
-        pass
-    return "libx264"
+    best = "libx264"
+    for encoder in ("h264_nvenc", "h264_amf", "h264_qsv"):
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=size=640x480:rate=60",
+                 "-frames:v", "5", *encoder_args(encoder, 20, "veryfast"),
+                 "-pix_fmt", "yuv420p", "-f", "null", "-"],
+                capture_output=True, timeout=20,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            best = encoder
+            break
+    _best_encoder_cache[ffmpeg] = best
+    return best
 
 
 def has_gfxcapture(ffmpeg: str) -> bool:
@@ -235,24 +263,13 @@ class Recorder:
         methods = ["gfxcapture", "gdigrab"] if has_gfxcapture(ffmpeg) else ["gdigrab"]
 
         # 映像エンコード
-        enc_args = ["-c:v", encoder]
-        if encoder == "libx264":
-            effective_preset = preset
-            if crf <= 17 and preset not in ("ultrafast", "superfast"):
-                effective_preset = "ultrafast"
-                self.log(
-                    f"[注意] CRF {crf} はlibx264の {preset} では追いつかないため "
-                    f"preset を ultrafast に自動上書きしました (画質は同等、ファイル増)"
-                )
-            enc_args.extend([
-                "-preset", effective_preset,
-                "-tune", "zerolatency",
-                "-crf", str(crf),
-            ])
-        elif encoder == "h264_nvenc":
-            enc_args.extend(["-preset", "p1", "-rc", "vbr", "-cq", str(crf), "-gpu", "any"])
-        else:
-            enc_args.extend(["-preset", "fast"])
+        if encoder == "libx264" and crf <= 17 and preset not in ("ultrafast", "superfast"):
+            self.log(
+                f"[注意] CRF {crf} はlibx264の {preset} では追いつかないため "
+                f"preset を ultrafast に自動上書きしました (画質は同等、ファイル増)"
+            )
+            preset = "ultrafast"
+        enc_args = encoder_args(encoder, crf, preset)
         enc_args.extend(["-pix_fmt", "yuv420p"])
 
         self._stderr_path = Path(tempfile.mktemp(suffix="_ffmpeg.log"))
@@ -624,6 +641,7 @@ class Recorder:
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "192k",
                     "-ac", "2",        # 8ch等をステレオへダウンミックス
+                    "-ar", "48000",    # デバイスごとに違うサンプルレートを揃える (後で無変換で結合できるように)
                     "-af", af,
                     "-shortest",
                     str(merged),

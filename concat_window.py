@@ -1,6 +1,7 @@
 """複数の動画ファイルを1本に結合するウィンドウ。"""
 
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -10,7 +11,81 @@ from tkinter import filedialog
 
 import customtkinter as ctk
 
-from recorder import find_ffmpeg
+from recorder import encoder_args, find_ffmpeg, get_best_encoder
+
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def probe(ffmpeg: str, path: str) -> dict | None:
+    """動画の形式 (コーデック・解像度・フレームレート・音声) を調べる。読めなければ None。"""
+    try:
+        err = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=_CREATE_NO_WINDOW, timeout=60,
+        ).stderr
+    except Exception:
+        return None
+    v = re.search(r"Stream #\d+:\d+.*?: Video: (\w+).*?, (\d+)x(\d+).*?, ([\d.]+) fps, ([\d.]+) tbr", err)
+    if not v:
+        return None
+    a = re.search(r"Stream #\d+:\d+.*?: Audio: (\w+).*?, (\d+) Hz, (\w+)", err)
+    d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+    return {
+        "vcodec": v[1], "width": int(v[2]), "height": int(v[3]),
+        # 平均と基準のフレームレートが違う = コマ落ちした可変フレームレートの動画
+        "fps": float(v[4]), "tbr": float(v[5]),
+        "audio": (a[1], int(a[2]), a[3]) if a else None,
+        "duration": (int(d[1]) * 3600 + int(d[2]) * 60 + float(d[3])) if d else 0.0,
+    }
+
+
+def can_stream_copy(infos: list[dict]) -> bool:
+    """再エンコードなしで結合できるか (全ファイルの形式が揃っているか)。"""
+    def key(i: dict):
+        return (i["vcodec"], i["width"], i["height"], i["tbr"], i["audio"])
+    return (
+        all(key(i) == key(infos[0]) for i in infos)
+        and all(abs(i["fps"] - i["tbr"]) < 0.5 for i in infos)
+    )
+
+
+def reencode_cmd(ffmpeg: str, files: list[str], infos: list[dict], out: str) -> list[str]:
+    """
+    形式の違う動画を、1 本目の解像度・60fps・48kHz ステレオに揃えて結合するコマンドを作る。
+    音声の無い動画には同じ長さの無音を足す (全部に音声が無ければ映像だけで結合する)。
+    """
+    w, h = infos[0]["width"], infos[0]["height"]
+    fps = round(infos[0]["tbr"]) or 60
+    with_audio = any(i["audio"] for i in infos)
+
+    cmd = [ffmpeg, "-y"]
+    for path in files:
+        cmd += ["-i", path]
+    silent_input: dict[int, int] = {}
+    for n, info in enumerate(infos):
+        if with_audio and not info["audio"]:
+            silent_input[n] = len(files) + len(silent_input)
+            cmd += ["-f", "lavfi", "-t", f"{info['duration']:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+
+    parts, labels = [], ""
+    for n in range(len(files)):
+        parts.append(
+            f"[{n}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{n}]"
+        )
+        labels += f"[v{n}]"
+        if with_audio:
+            src = f"{silent_input[n]}:a" if n in silent_input else f"{n}:a"
+            parts.append(f"[{src}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{n}]")
+            labels += f"[a{n}]"
+    parts.append(f"{labels}concat=n={len(files)}:v=1:a={1 if with_audio else 0}[v]" + ("[a]" if with_audio else ""))
+
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[v]"]
+    if with_audio:
+        cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+    cmd += [*encoder_args(get_best_encoder(ffmpeg), 18, "veryfast"), "-pix_fmt", "yuv420p", out]
+    return cmd
 
 
 class ConcatWindow(ctk.CTkToplevel):
@@ -148,31 +223,45 @@ class ConcatWindow(ctk.CTkToplevel):
         self._status_var.set("結合中...")
         files = list(self._files)
 
+        def _status(text: str) -> None:
+            self.after(0, lambda: self._status_var.set(text))
+
         def _worker():
+            list_path = None
             try:
-                fd, list_path = tempfile.mkstemp(suffix=".txt")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    for p in files:
-                        escaped = p.replace("'", "'\\''")
-                        f.write(f"file '{escaped}'\n")
-                CREATE_NO_WINDOW = 0x08000000
+                infos = [probe(ffmpeg, p) for p in files]
+                if all(infos) and not can_stream_copy(infos):
+                    # 形式が揃っていないものを無変換でつなぐと、途中から映像や音が壊れる
+                    _status("形式の違う動画があるため、変換しながら結合中...（時間がかかります）")
+                    cmd = reencode_cmd(ffmpeg, files, infos, out)
+                else:
+                    fd, list_path = tempfile.mkstemp(suffix=".txt")
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        for p in files:
+                            escaped = p.replace("'", "'\\''")
+                            f.write(f"file '{escaped}'\n")
+                    cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                           "-i", list_path, "-c", "copy", out]
                 result = subprocess.run(
-                    [ffmpeg, "-y", "-f", "concat", "-safe", "0",
-                     "-i", list_path, "-c", "copy", out],
+                    cmd,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    creationflags=CREATE_NO_WINDOW,
+                    creationflags=_CREATE_NO_WINDOW,
                     timeout=3600,
                 )
-                os.unlink(list_path)
                 if result.returncode == 0:
-                    self.after(0, lambda: self._status_var.set(f"完了: {Path(out).name}"))
+                    _status(f"完了: {Path(out).name}")
                 else:
                     lines = result.stderr.splitlines()
                     msg = next((l.strip() for l in reversed(lines) if l.strip()), "不明なエラー")
-                    self.after(0, lambda: self._status_var.set(f"エラー: {msg}"))
+                    _status(f"エラー: {msg}")
             except Exception as e:
-                self.after(0, lambda: self._status_var.set(f"エラー: {e}"))
+                _status(f"エラー: {e}")
             finally:
+                if list_path:
+                    try:
+                        os.unlink(list_path)
+                    except OSError:
+                        pass
                 self.after(0, lambda: self._btn.configure(state="normal"))
 
         threading.Thread(target=_worker, daemon=True).start()

@@ -268,7 +268,12 @@ class TrimWindow(ctk.CTkToplevel):
         end_sec   = f"{end_f / self._fps:.3f}"
 
         src = Path(self._video_path)
+        # 既存の切り抜きを上書きしないよう、空いている名前を探す (_clip, _clip2, ...)
         out = src.parent / f"{src.stem}_clip{src.suffix}"
+        n = 2
+        while out.exists():
+            out = src.parent / f"{src.stem}_clip{n}{src.suffix}"
+            n += 1
 
         if self._precise_var.get():
             # 再エンコード: -ss を -i の前に置いてフレーム精度で切り出す

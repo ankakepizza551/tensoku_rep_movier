@@ -179,6 +179,41 @@ def focus_window(hwnd: int) -> None:
         pass
 
 
+def disable_rounded_corners(hwnd: int) -> None:
+    """
+    Windows 11 のウィンドウ角丸を無効にする。
+    角丸のままだと、録画した映像の下隅数ピクセルに後ろの画面が写り込む。
+    """
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWCP_DONOTROUND = 1
+    try:
+        pref = ctypes.c_int(DWMWCP_DONOTROUND)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(pref), ctypes.sizeof(pref),
+        )
+    except Exception:
+        pass   # Windows 10 以前は角丸自体がない
+
+
+def grab_window_png(hwnd: int, ffmpeg: str) -> bytes | None:
+    """
+    ゲームウィンドウのクライアント領域を 1 枚だけ撮って PNG のバイト列で返す。
+    録画と同じくウィンドウ単位で撮るので、他のウィンドウが重なっていても写り込まない。
+    """
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error",
+             "-f", "gdigrab", "-draw_mouse", "0", "-i", f"hwnd={hwnd}",
+             "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"],
+            capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+        )
+        return proc.stdout if proc.returncode == 0 and proc.stdout else None
+    except Exception:
+        return None
+
+
 def sample_window_pixels(hwnd: int, cols: int = 5, rows: int = 4) -> list[int] | None:
     """
     ゲームウィンドウのクライアント領域をグリッドサンプリングしてピクセル値リストを返す。
@@ -412,8 +447,11 @@ class _ElevatedProcess:
 def launch_game(th123_path: str) -> subprocess.Popen | _ElevatedProcess:
     """
     th123.EXE を起動する。
-    管理者権限が必要な場合 (WinError 740) は ShellExecuteEx で UAC 昇格して起動する。
     戻り値の .pid で起動したプロセスの PID を取得できる。
+
+    ゲームが管理者権限を要求する設定 (WinError 740) の場合、このツールも管理者で
+    動いていないとキー送信が届かない。ツールが管理者なら昇格して起動し、
+    そうでなければ案内を出して中断する。
     """
     try:
         return subprocess.Popen(
@@ -422,6 +460,11 @@ def launch_game(th123_path: str) -> subprocess.Popen | _ElevatedProcess:
         )
     except OSError as e:
         if getattr(e, "winerror", None) == 740:
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                raise RuntimeError(
+                    "th123.EXE が管理者権限を要求しています。\n"
+                    "このツールを右クリック →「管理者として実行」で起動し直してください。"
+                ) from e
             import win32com.shell.shell as shell
             import win32com.shell.shellcon as shellcon
             result = shell.ShellExecuteEx(

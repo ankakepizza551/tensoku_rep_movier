@@ -56,9 +56,9 @@ def main() -> None:
     run([
         sys.executable, "-m", "PyInstaller",
         "--onedir",
+        "--noconfirm",   # 前回のビルド出力を確認なしで上書きする
         "--windowed",
         f"--name={NAME}",
-        "--uac-admin",
         *icon_args,
         *dll_args,
         "--collect-all", "customtkinter",
@@ -87,10 +87,13 @@ def main() -> None:
         print(f"[注意] ffmpeg\\ffmpeg.exe が見つかりません。")
         print(f"       ビルド後に手動で {ffmpeg_dst} へコピーしてください。")
 
-    # README をコピー
+    # README とライセンスをコピー
     readme = HERE / "README.txt"
     if readme.exists():
         shutil.copy2(readme, DIST / "README.txt")
+    license_file = HERE / "LICENSE"
+    if license_file.exists():
+        shutil.copy2(license_file, DIST / "LICENSE.txt")
 
     print(f"\n===== ビルド完了 =====")
     print(f"出力先: {DIST}")
