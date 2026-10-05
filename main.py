@@ -131,12 +131,29 @@ class RecordSession:
         r = _wg.GetWindowRect(hwnd)
         self.log_q.put(f"__GAME_RECT__:{r[0]}:{r[1]}:{r[2]}:{r[3]}")
 
+        # タイトル画面に着くまで待つ。ロゴ表示中に Z を送るとロゴスキップに消費されて
+        # 以降のキーが 1 つずつずれ、リプレイではなく別のメニューに入ってしまう。
+        pid = self._game_proc.pid
         wait = cfg["wait_after_launch"]
-        self._log(f"ゲーム起動待ち ({wait:.0f}秒)...")
-        for _ in range(int(wait * 2)):
-            if self._stop_event.is_set():
-                return
-            time.sleep(0.5)
+        self._log("タイトル画面を待っています...")
+        reached = game.wait_for_scene(
+            pid, (game.SCENE_TITLE,), timeout=max(wait, 60.0),
+            should_stop=self._stop_event.is_set,
+        )
+        if self._stop_event.is_set():
+            return
+        if reached:
+            time.sleep(1.0)   # タイトル表示直後は入力を受け付けないため少し待つ
+        else:
+            # シーンが読めない (非対応バージョン等) 場合は従来通り固定秒数で待つ
+            if reached is None:
+                self._log(f"画面状態を取得できないため固定で待ちます ({wait:.0f}秒)...")
+            else:
+                self._log("[警告] タイトル画面への到達を確認できませんでした (そのまま続行)")
+            for _ in range(int(wait * 2)):
+                if self._stop_event.is_set():
+                    return
+                time.sleep(0.5)
 
         if self._stop_event.is_set():
             return
@@ -148,6 +165,20 @@ class RecordSession:
             key_delay=cfg["key_delay"],
             log=self._log,
         )
+
+        # リプレイ再生 (ロード → 対戦画面) に入れたか確認。入れていなければ録画しない
+        if reached:
+            playing = game.wait_for_scene(
+                pid, (game.SCENE_LOADING, game.SCENE_BATTLE), timeout=10.0,
+                should_stop=self._stop_event.is_set,
+            )
+            if self._stop_event.is_set():
+                return
+            if playing is False:
+                raise RuntimeError(
+                    "リプレイ再生を開始できませんでした。\n"
+                    "「メニュー↓回数」「選択後Z回数」を確認してください。"
+                )
 
         audio_dev = cfg.get("audio_device", "なし(無音)")
         # ゲーム音のみモード: ルーティング成功時のみ VB-Cable ループバックを自動選択
@@ -163,7 +194,6 @@ class RecordSession:
         audio_dev_arg = None if audio_dev == "なし(無音)" else audio_dev
 
         self._hwnd = hwnd
-        game.set_topmost(hwnd, True)
         self._recorder.start(
             hwnd=hwnd,
             output_path=self.output_path,
@@ -172,7 +202,7 @@ class RecordSession:
             preset=cfg["preset"],
             audio_device=audio_dev_arg,
         )
-        self._log("録画中 (ゲームウィンドウを最前面に固定しました)")
+        self._log("録画中 (ウィンドウ単位でキャプチャしています。最小化しなければ他の作業をしても問題ありません)")
 
         self._log("リプレイ再生中...")
         deadline = (time.time() + auto_dur) if auto_dur is not None else None
@@ -185,6 +215,8 @@ class RecordSession:
         _record_start = time.time()
         _last_pixels: list | None = None
         _static_since: float | None = None
+        _next_sample = 0.0
+        _seen_battle = False    # 対戦画面に入ったのを確認済みか (シーン遷移による終了検出用)
 
         while True:
             if self._stop_event.is_set():
@@ -198,8 +230,21 @@ class RecordSession:
                 self._log("自動停止: 推定再生時間を超えました")
                 break
 
+            # 対戦画面を抜けた (リプレイメニューに戻った) らリプレイ終了。
+            # 画面静止検出より正確で、終了後のメニュー画面が動画に残らない。
+            if cfg.get("auto_stop", True):
+                scene = game.read_scene(pid)
+                if scene is not None:
+                    # 片方だけ変わった時点はまだ暗転中。両方変わるまで待って暗転も録る
+                    if game.SCENE_BATTLE in scene:
+                        _seen_battle = _seen_battle or scene[0] == scene[1]
+                    elif _seen_battle:
+                        self._log("リプレイ終了を検出しました")
+                        break
+
             elapsed = now - _record_start
-            if elapsed >= _GRACE_SECS and cfg.get("auto_stop", True):
+            if elapsed >= _GRACE_SECS and cfg.get("auto_stop", True) and now >= _next_sample:
+                _next_sample = now + 0.5
                 pixels = game.sample_window_pixels(self._hwnd)
                 if pixels is not None:
                     if _last_pixels is not None:
@@ -219,11 +264,9 @@ class RecordSession:
                 rm, rs = divmod(remaining, 60)
                 self._log(f"[自動停止まで残り {rm}分{rs:02d}秒]")
                 _next_notice = now + 60.0
-            time.sleep(0.5)
+            time.sleep(0.1)
 
     def _cleanup(self) -> None:
-        if hasattr(self, "_hwnd"):
-            game.set_topmost(self._hwnd, False)
         self._recorder.stop()
         if self._game_proc and game.is_running(self._game_proc):
             try:
@@ -360,9 +403,12 @@ class App(ctk.CTk):
         cfg_audio = self._cfg.get("audio_device", "なし(無音)")
         if cfg_audio not in devices:
             cfg_audio = "なし(無音)"
-        # 初回起動時(audio_device未保存)はループバックをデフォルトにする
+        # 初回起動時(audio_device未保存)は既定の再生デバイスのループバックをデフォルトにする
+        # (ゲーム音は既定デバイスから出るので、他のデバイスを選ぶと無音になる)
         if "audio_device" not in self._cfg:
-            loopback = next((d for d in devices if d.startswith(rec_mod.WASAPI_PREFIX)), None)
+            loopback = rec_mod.get_default_loopback_device()
+            if loopback not in devices:
+                loopback = next((d for d in devices if d.startswith(rec_mod.WASAPI_PREFIX)), None)
             if loopback:
                 cfg_audio = loopback
         self._audio_var = ctk.StringVar(value=cfg_audio)

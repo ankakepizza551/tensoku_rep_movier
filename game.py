@@ -179,39 +179,104 @@ def focus_window(hwnd: int) -> None:
         pass
 
 
-def set_topmost(hwnd: int, topmost: bool) -> None:
-    """ウィンドウを常に最前面 or 通常に切り替える。"""
-    flag = win32con.HWND_TOPMOST if topmost else win32con.HWND_NOTOPMOST
-    try:
-        win32gui.SetWindowPos(
-            hwnd, flag, 0, 0, 0, 0,
-            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE,
-        )
-    except Exception:
-        pass
-
-
 def sample_window_pixels(hwnd: int, cols: int = 5, rows: int = 4) -> list[int] | None:
     """
     ゲームウィンドウのクライアント領域をグリッドサンプリングしてピクセル値リストを返す。
     画面変化の検出に使用する。取得失敗時は None を返す。
+
+    ウィンドウ DC から BitBlt で取得する（録画の gdigrab と同じ取り方）。
+    PrintWindow は th123 (Direct3D) だと常に真っ黒を返すため使えない。
+    真っ黒だとキー送信の受付判定が毎回「反応なし」になって Z を余分に再送し、
+    メニュー遷移がずれる / 静止検出が誤発火する。
     """
     try:
         cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
         w, h = cr - cl, cb - ct
         if w <= 0 or h <= 0:
             return None
-        pt = ctypes.wintypes.POINT(0, 0)
-        ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
-        ox, oy = pt.x, pt.y
-        xs = [ox + int(w * (i + 1) / (cols + 1)) for i in range(cols)]
-        ys = [oy + int(h * (j + 1) / (rows + 1)) for j in range(rows)]
-        hdc = ctypes.windll.user32.GetDC(0)
-        pixels = [ctypes.windll.gdi32.GetPixel(hdc, x, y) for x in xs for y in ys]
-        ctypes.windll.user32.ReleaseDC(0, hdc)
-        return pixels
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        SRCCOPY = 0x00CC0020
+
+        hdc_win = user32.GetDC(hwnd)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_win)
+        bitmap = gdi32.CreateCompatibleBitmap(hdc_win, w, h)
+        old_obj = gdi32.SelectObject(hdc_mem, bitmap)
+        try:
+            if not gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_win, 0, 0, SRCCOPY):
+                return None
+            xs = [int(w * (i + 1) / (cols + 1)) for i in range(cols)]
+            ys = [int(h * (j + 1) / (rows + 1)) for j in range(rows)]
+            return [gdi32.GetPixel(hdc_mem, x, y) for x in xs for y in ys]
+        finally:
+            gdi32.SelectObject(hdc_mem, old_obj)
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(hwnd, hdc_win)
     except Exception:
         return None
+
+
+# ── シーン取得 ──────────────────────────────────────────
+
+# th123.exe (Ver1.10a) が現在のシーン ID / 遷移先シーン ID を置いているアドレス
+_ADDR_SCENE_ID     = 0x008A0040
+_ADDR_NEW_SCENE_ID = 0x008A0044
+
+SCENE_LOGO    = 0
+SCENE_TITLE   = 2
+SCENE_BATTLE  = 5
+SCENE_LOADING = 6
+
+_kernel32 = ctypes.windll.kernel32
+_kernel32.OpenProcess.restype = ctypes.c_void_p
+_kernel32.ReadProcessMemory.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+]
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+
+def read_scene(pid: int) -> tuple[int, int] | None:
+    """(現在のシーン ID, 遷移先シーン ID) を返す。読めなければ None。"""
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    hproc = _kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not hproc:
+        return None
+    try:
+        values = []
+        for addr in (_ADDR_SCENE_ID, _ADDR_NEW_SCENE_ID):
+            buf = ctypes.c_uint32(0)
+            if not _kernel32.ReadProcessMemory(hproc, addr, ctypes.byref(buf), 4, None):
+                return None
+            values.append(buf.value)
+        return values[0], values[1]
+    finally:
+        _kernel32.CloseHandle(hproc)
+
+
+def wait_for_scene(
+    pid: int,
+    scenes: tuple[int, ...],
+    timeout: float,
+    should_stop: Callable[[], bool] = lambda: False,
+) -> bool | None:
+    """
+    現在・遷移先の両方が scenes のいずれかになる (= 遷移が完了する) まで待つ。
+    到達したら True、タイムアウト/中断なら False、シーンが読めない場合は None。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if should_stop():
+            return False
+        scene = read_scene(pid)
+        if scene is None:
+            return None
+        if scene[0] in scenes and scene[1] in scenes:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 # ── リプレイファイル管理 ──────────────────────────────────

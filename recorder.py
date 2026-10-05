@@ -46,6 +46,20 @@ def _get_wasapi_loopback_devices() -> list[str]:
     return []
 
 
+def get_default_loopback_device() -> str | None:
+    """既定の再生デバイスに対応するループバックデバイス名 (WASAPI_PREFIX 付き) を返す。"""
+    try:
+        import pyaudiowpatch as pyaudio
+        pa = pyaudio.PyAudio()
+        try:
+            name = pa.get_default_wasapi_loopback().get("name", "")
+            return f"{WASAPI_PREFIX}{name}" if name else None
+        finally:
+            pa.terminate()
+    except Exception:
+        return None
+
+
 def _get_dshow_audio_devices() -> list[str]:
     """DirectShow の音声入力デバイスを列挙する（ステレオミキサー等）。"""
     ffmpeg = find_ffmpeg()
@@ -117,6 +131,20 @@ def get_best_encoder(ffmpeg: str) -> str:
     return "libx264"
 
 
+def has_gfxcapture(ffmpeg: str) -> bool:
+    """ffmpeg が gfxcapture (Windows.Graphics.Capture) に対応しているか。"""
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-filters"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW
+        )
+        return " gfxcapture " in proc.stdout
+    except Exception:
+        return False
+
+
 class Recorder:
     def __init__(self, log: Callable = print):
         self._proc: subprocess.Popen | None = None
@@ -138,6 +166,7 @@ class Recorder:
         self._video_start_time: float = 0.0
         self._audio_start_time: float = 0.0
         self._audio_channels: int = 2
+        self._audio_device: str | None = None
 
     def start(
         self,
@@ -157,12 +186,8 @@ class Recorder:
         encoder = get_best_encoder(ffmpeg)
         self.log(f"[診断] 使用エンコーダー: {encoder}")
 
-        # クライアント領域を取得
-        import ctypes
+        # クライアント領域のサイズを取得
         cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
-        pt = ctypes.wintypes.POINT(cl, ct)
-        ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
-        left, top = pt.x, pt.y
         width, height = cr - cl, cb - ct
         width  = width  if width  % 2 == 0 else width  - 1
         height = height if height % 2 == 0 else height - 1
@@ -176,21 +201,41 @@ class Recorder:
         use_wasapi = audio_device and audio_device.startswith(WASAPI_PREFIX)
         use_dshow  = bool(audio_device) and not use_wasapi
 
-        # 映像入力 (gdigrab) — 音声は含めない
-        cmd = [
-            ffmpeg, "-y",
-            "-thread_queue_size", "2048",
-            "-f", "gdigrab",
-            "-draw_mouse", "0",
-            "-framerate", str(framerate),
-            "-offset_x", str(left),
-            "-offset_y", str(top),
-            "-video_size", f"{width}x{height}",
-            "-i", "desktop",
-        ]
+        # 映像入力 — 音声は含めない
+        # どちらの方式もウィンドウ自体をハンドル指定でキャプチャするので、他のウィンドウに
+        # 重なられても正しく録画できる (最小化さえされなければOK)。
+        #
+        # gfxcapture (Windows.Graphics.Capture): 60fps で取りこぼしなく録れる。優先して使う。
+        #   フレームは画面更新時にしか来ないので、cfr で一定フレームレートに揃える。
+        # gdigrab: 古い ffmpeg / Windows 用のフォールバック。実測 50fps 前後までしか出ない。
+        #   クライアント領域が原点なので offset は不要 (枠の分をずらすと
+        #   "Capture area ... extends outside window area" で起動に失敗する)。
+        #   title= だと同名ウィンドウを誤って掴むことがあるため hwnd= を使う。
+        inputs = {
+            "gfxcapture": (
+                [
+                    "-f", "lavfi",
+                    "-i", f"gfxcapture=hwnd={hwnd}:capture_cursor=0:max_framerate={framerate}"
+                          ":width=-2:height=-2",
+                ],
+                ["-vf", "hwdownload,format=bgra", "-fps_mode", "cfr", "-r", str(framerate)],
+            ),
+            "gdigrab": (
+                [
+                    "-thread_queue_size", "2048",
+                    "-f", "gdigrab",
+                    "-draw_mouse", "0",
+                    "-framerate", str(framerate),
+                    "-video_size", f"{width}x{height}",
+                    "-i", f"hwnd={hwnd}",
+                ],
+                [],
+            ),
+        }
+        methods = ["gfxcapture", "gdigrab"] if has_gfxcapture(ffmpeg) else ["gdigrab"]
 
         # 映像エンコード
-        cmd.extend(["-c:v", encoder])
+        enc_args = ["-c:v", encoder]
         if encoder == "libx264":
             effective_preset = preset
             if crf <= 17 and preset not in ("ultrafast", "superfast"):
@@ -199,42 +244,54 @@ class Recorder:
                     f"[注意] CRF {crf} はlibx264の {preset} では追いつかないため "
                     f"preset を ultrafast に自動上書きしました (画質は同等、ファイル増)"
                 )
-            cmd.extend([
+            enc_args.extend([
                 "-preset", effective_preset,
                 "-tune", "zerolatency",
                 "-crf", str(crf),
             ])
         elif encoder == "h264_nvenc":
-            cmd.extend(["-preset", "p1", "-rc", "vbr", "-cq", str(crf), "-gpu", "any"])
+            enc_args.extend(["-preset", "p1", "-rc", "vbr", "-cq", str(crf), "-gpu", "any"])
         else:
-            cmd.extend(["-preset", "fast"])
-
-        cmd.extend(["-pix_fmt", "yuv420p"])
-        cmd.extend([str(self._tmp_path)])
+            enc_args.extend(["-preset", "fast"])
+        enc_args.extend(["-pix_fmt", "yuv420p"])
 
         self._stderr_path = Path(tempfile.mktemp(suffix="_ffmpeg.log"))
-        self._stderr_file = open(self._stderr_path, "w", encoding="utf-8", errors="replace")
 
         CREATE_NO_WINDOW = 0x08000000
         ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr_file,
-            creationflags=CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS,
-        )
+        for i, method in enumerate(methods):
+            in_args, out_args = inputs[method]
+            cmd = [ffmpeg, "-y", *in_args, *out_args, *enc_args, str(self._tmp_path)]
+            self._stderr_file = open(self._stderr_path, "w", encoding="utf-8", errors="replace")
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_file,
+                creationflags=CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS,
+            )
 
-        self._video_start_time = time.time()
-        time.sleep(0.5)
-        rc = self._proc.poll()
-        if rc is not None:
-            self._stderr_file.flush()
+            self._video_start_time = time.time()
+            time.sleep(0.5)
+            rc = self._proc.poll()
+            if rc is None:
+                self.log(f"[診断] キャプチャ方式: {method}")
+                break
+
+            self._stderr_file.close()
             err_text = ""
             try:
                 err_text = self._stderr_path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+            if i < len(methods) - 1:
+                last = next((l.strip() for l in reversed(err_text.splitlines()) if l.strip()), "")
+                self.log(f"[注意] {method} で録画を開始できませんでした。{methods[i + 1]} に切り替えます")
+                if last:
+                    self.log(f"  {last}")
+                continue
+
+            self._stderr_file = None
             self.log(f"[エラー] FFmpeg が即座に終了しました (終了コード: {rc} / 0x{rc & 0xFFFFFFFF:08X})")
             if err_text.strip():
                 for line in err_text.splitlines()[-15:]:
@@ -247,6 +304,7 @@ class Recorder:
             raise RuntimeError(f"FFmpeg の起動に失敗しました (コード: {rc})")
 
         # FFmpeg 起動確認後に音声キャプチャ開始 → 映像との同期ズレを最小化
+        self._audio_device = audio_device
         if use_wasapi:
             self._start_wasapi_capture(audio_device)
         elif use_dshow:
@@ -338,9 +396,13 @@ class Recorder:
             except Exception as e:
                 self.log(f"[警告] ループバック列挙エラー: {e}")
 
+            # ストリームは PyAudio を作ったのと同じスレッドで開く必要がある
+            # (別スレッドで開くと "Unanticipated host error" で失敗して無音になる)。
+            # ここではデバイス情報だけ取り、キャプチャスレッド側で作り直す。
+            pa.terminate()
+
             if device_info is None:
                 self.log("[警告] WASAPIループバックデバイスが見つかりません (音声なしで録画します)")
-                pa.terminate()
                 return
 
             self.log(f"[診断] ループバック対象: {device_info.get('name', '?')} (index={device_info.get('index')})")
@@ -362,6 +424,7 @@ class Recorder:
             def _capture():
                 wf = None
                 stream = None
+                pa = pyaudio.PyAudio()
                 frames_written = [0]  # コールバックから参照するためリストで包む
 
                 # サラウンドヘッドセット等の多chデバイスはステレオで開く
@@ -493,6 +556,15 @@ class Recorder:
 
         rc = self._proc.returncode if self._proc else None
         self.log(f"[診断] FFmpeg 終了コード: {rc}")
+        try:
+            import re
+            stats = re.findall(r"frame=\s*(\d+).*?dup=(\d+) drop=(\d+)",
+                               self._stderr_path.read_text(encoding="utf-8", errors="replace"))
+            if stats:
+                frames, dup, drop = stats[-1]
+                self.log(f"[診断] フレーム数: {frames} (補完: {dup} / 破棄: {drop})")
+        except Exception:
+            pass
 
         if self._tmp_path and self._tmp_path.exists() and self._tmp_path.stat().st_size > 0:
             # 音声を別録りしていた場合はマージしてからリネーム
@@ -500,6 +572,12 @@ class Recorder:
             if self._wasapi_wav_path and self._wasapi_wav_path.exists() and \
                self._wasapi_wav_path.stat().st_size > 44:
                 self._merge_audio_video()
+            elif self._wasapi_wav_path:
+                # ループバックは対象デバイスに音が流れていないと 1 サンプルも録れない
+                self.log("[警告] 音声が録音されませんでした (映像のみで保存します)")
+                default = get_default_loopback_device()
+                if default and default != self._audio_device:
+                    self.log(f"  → ゲーム音は既定の再生デバイスから出ます。「音声録音」で次を選んでください: {default}")
             self._rename_output()
         else:
             self._show_ffmpeg_error()
