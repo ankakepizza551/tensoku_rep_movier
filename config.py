@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
     "auto_open_trim": False,
     "auto_stop": True,
     "game_audio_only": False,
+    "trim_loading": True,       # 動画の冒頭のロード画面をカットする
     "filename_template": "{stem}",
 }
 

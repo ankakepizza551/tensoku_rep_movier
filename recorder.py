@@ -173,6 +173,70 @@ def has_gfxcapture(ffmpeg: str) -> bool:
         return False
 
 
+_job_handle = None
+
+
+def _kill_with_parent(proc: subprocess.Popen) -> None:
+    """
+    このツールが (異常終了も含めて) 終了したら、proc も一緒に終了させる。
+    これをしないと、ツールが落ちたときに ffmpeg だけが残って録画し続ける。
+    Windows のジョブオブジェクトに入れておくと、ツール側のハンドルが閉じた時点で
+    OS がジョブ内のプロセスを終了させる。
+    """
+    global _job_handle
+    import ctypes
+    from ctypes import wintypes
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _EXTENDED(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC),
+            ("IoInfo", _IO),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JobObjectExtendedLimitInformation = 9
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        if _job_handle is None:
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = _EXTENDED()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                               ctypes.byref(info), ctypes.sizeof(info)):
+                return
+            _job_handle = job   # プロセス終了まで開いたままにする
+        k32.AssignProcessToJobObject(_job_handle, int(proc._handle))
+    except Exception:
+        pass   # 失敗しても録画自体はできる
+
+
 class Recorder:
     def __init__(self, log: Callable = print):
         self._proc: subprocess.Popen | None = None
@@ -195,6 +259,13 @@ class Recorder:
         self._audio_start_time: float = 0.0
         self._audio_channels: int = 2
         self._audio_device: str | None = None
+        # プロセス単位の録音 (ゲーム音のみ)
+        self._proc_capture = None
+
+    @property
+    def video_start_time(self) -> float:
+        """映像の録画を開始した時刻 (time.time())。"""
+        return self._video_start_time
 
     def start(
         self,
@@ -204,7 +275,12 @@ class Recorder:
         crf: int,
         preset: str,
         audio_device: str | None = None,
+        audio_pid: int | None = None,
     ) -> None:
+        """
+        hwnd のウィンドウの録画を始める。
+        audio_pid を渡すと、そのプロセスの音だけを録音する (できなければ audio_device を使う)。
+        """
         import win32gui
 
         ffmpeg = find_ffmpeg()
@@ -220,10 +296,11 @@ class Recorder:
         width  = width  if width  % 2 == 0 else width  - 1
         height = height if height % 2 == 0 else height - 1
 
+        # 録画中は MKV に書き、終了時に MP4 へ仕上げる。
+        # MP4 は最後まで書き終えないと再生できないが、MKV は途中で切れても
+        # そこまでの映像が再生できるので、ツールや PC が落ちても録画が残る。
         self._final_path = Path(output_path)
-        tmp_fd, tmp_str = tempfile.mkstemp(suffix=".mp4", dir=self._final_path.parent)
-        import os; os.close(tmp_fd)
-        self._tmp_path = Path(tmp_str)
+        self._tmp_path = self._final_path.with_name(self._final_path.stem + ".recording.mkv")
 
         # WASAPI・DirectShow ともに別録り → FFmpeg 映像のみ
         use_wasapi = audio_device and audio_device.startswith(WASAPI_PREFIX)
@@ -243,8 +320,11 @@ class Recorder:
             "gfxcapture": (
                 [
                     "-f", "lavfi",
+                    # 後半の枝は、最初の 1 コマが届いた瞬間にログへ 1 行出すためだけのもの
+                    # (その時刻を映像の開始時刻として、音声とのズレ補正に使う)
                     "-i", f"gfxcapture=hwnd={hwnd}:capture_cursor=0:max_framerate={framerate}"
-                          ":width=-2:height=-2",
+                          ":width=-2:height=-2,split[out0][probe];"
+                          "[probe]select=eq(n\\,0),showinfo=checksum=0,nullsink",
                 ],
                 ["-vf", "hwdownload,format=bgra", "-fps_mode", "cfr", "-r", str(framerate)],
             ),
@@ -270,7 +350,8 @@ class Recorder:
             )
             preset = "ultrafast"
         enc_args = encoder_args(encoder, crf, preset)
-        enc_args.extend(["-pix_fmt", "yuv420p"])
+        # キーフレームを 1 秒ごとに入れる。仕上げで冒頭を無変換のままカットできるようにするため
+        enc_args.extend(["-g", str(framerate), "-pix_fmt", "yuv420p"])
 
         self._stderr_path = Path(tempfile.mktemp(suffix="_ffmpeg.log"))
 
@@ -278,7 +359,9 @@ class Recorder:
         ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
         for i, method in enumerate(methods):
             in_args, out_args = inputs[method]
-            cmd = [ffmpeg, "-y", *in_args, *out_args, *enc_args, str(self._tmp_path)]
+            # -flush_packets 1: 1 コマごとにディスクへ書き出す。まとめて書く既定の動作だと、
+            # 強制終了されたときに最後の数秒 (短い録画なら全部) が失われる。
+            cmd = [ffmpeg, "-y", *in_args, *out_args, *enc_args, "-flush_packets", "1", str(self._tmp_path)]
             self._stderr_file = open(self._stderr_path, "w", encoding="utf-8", errors="replace")
             self._proc = subprocess.Popen(
                 cmd,
@@ -287,9 +370,26 @@ class Recorder:
                 stderr=self._stderr_file,
                 creationflags=CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS,
             )
+            _kill_with_parent(self._proc)
 
-            self._video_start_time = time.time()
-            time.sleep(0.5)
+            # 映像の開始時刻 = 最初のコマが届いた時刻。ffmpeg を起動してから最初のコマが
+            # 来るまでには遅れ (gfxcapture で 0.2 秒ほど) があり、起動時刻を開始とみなすと
+            # その分だけ音が遅れて聞こえる動画になる。
+            launched = time.time()
+            self._video_start_time = launched
+            first_frame_seen = False
+            while time.time() - launched < 0.5 or (
+                    method == "gfxcapture" and not first_frame_seen and time.time() - launched < 3.0):
+                if self._proc.poll() is not None:
+                    break
+                if method == "gfxcapture" and not first_frame_seen:
+                    try:
+                        if "pts_time:" in self._stderr_path.read_text(encoding="utf-8", errors="replace"):
+                            first_frame_seen = True
+                            self._video_start_time = time.time()
+                    except OSError:
+                        pass
+                time.sleep(0.005)
             rc = self._proc.poll()
             if rc is None:
                 self.log(f"[診断] キャプチャ方式: {method}")
@@ -322,12 +422,35 @@ class Recorder:
 
         # FFmpeg 起動確認後に音声キャプチャ開始 → 映像との同期ズレを最小化
         self._audio_device = audio_device
-        if use_wasapi:
+        if audio_pid and self._start_process_capture(audio_pid):
+            pass
+        elif use_wasapi:
             self._start_wasapi_capture(audio_device)
         elif use_dshow:
             self._start_dshow_capture(audio_device)
 
         self.log(f"FFmpeg 録画開始: {self._final_path.name}")
+
+    def _start_process_capture(self, pid: int) -> bool:
+        """pid のプロセスの音だけを録音する。開始できなければ False。"""
+        try:
+            import os
+            import process_audio
+            tmp_fd, tmp_str = tempfile.mkstemp(suffix="_proc.wav")
+            os.close(tmp_fd)
+            capture = process_audio.ProcessLoopbackCapture(pid, Path(tmp_str), log=self.log)
+            if not capture.start():
+                Path(tmp_str).unlink(missing_ok=True)
+                return False
+            self._proc_capture = capture
+            self._wasapi_wav_path = Path(tmp_str)
+            self._audio_channels = 2
+            self._audio_start_time = time.time()
+            self.log("ゲームの音だけを録音します")
+            return True
+        except Exception as e:
+            self.log(f"[警告] プロセス単位の録音を開始できませんでした ({e})")
+            return False
 
     def _start_dshow_capture(self, audio_device: str) -> None:
         """DirectShow デバイスを別 FFmpeg プロセスで録音する。"""
@@ -364,6 +487,7 @@ class Recorder:
                 stderr=dshow_log_file,
                 creationflags=CREATE_NO_WINDOW,
             )
+            _kill_with_parent(self._dshow_proc)
             time.sleep(0.5)
             rc = self._dshow_proc.poll()
             if rc is not None:
@@ -467,6 +591,9 @@ class Recorder:
 
                     # コールバック方式 → blocking read() によるフリーズを防ぐ
                     def _callback(in_data, frame_count, time_info, status):
+                        if frames_written[0] == 0:
+                            # 最初のデータが届いた時刻から、その中身の長さを引いたものが録音の開始時刻
+                            self._audio_start_time = time.time() - frame_count / sample_rate
                         wf.writeframes(in_data)
                         frames_written[0] += frame_count
                         return (None, pyaudio.paContinue if not stop_event.is_set() else pyaudio.paComplete)
@@ -511,16 +638,28 @@ class Recorder:
         except Exception as e:
             self.log(f"[警告] 音声キャプチャ開始失敗: {e}")
 
-    def stop(self) -> None:
+    def stop(self, trim_start: float = 0.0, discard: bool = False) -> None:
+        """
+        録画を止めて MP4 に仕上げる。trim_start 秒より前 (冒頭) は切り落とす。
+        discard=True なら録ったものを保存せずに捨てる。
+        """
         if self._proc and self._proc.poll() is None:
             self.log("FFmpeg 録画停止中...")
             try:
                 self._proc.stdin.write(b"q")
                 self._proc.stdin.flush()
-                self._proc.wait(timeout=15)
+                # 画面が止まっている (最小化された等) と新しいコマが来るまで q が処理されない。
+                # 長く待たずに終了させる。録画は MKV に書き出し済みなので失われない。
+                self._proc.wait(timeout=5)
             except Exception:
                 self._proc.terminate()
                 self._proc.wait(timeout=5)
+
+        # プロセス単位の録音を停止
+        if self._proc_capture:
+            self._proc_capture.stop()
+            self._audio_start_time = self._proc_capture.start_time
+            self._proc_capture = None
 
         # WASAPIキャプチャを停止
         if self._wasapi_stop:
@@ -583,7 +722,10 @@ class Recorder:
         except Exception:
             pass
 
-        if self._tmp_path and self._tmp_path.exists() and self._tmp_path.stat().st_size > 0:
+        if discard:
+            if self._tmp_path:
+                self._tmp_path.unlink(missing_ok=True)
+        elif self._tmp_path and self._tmp_path.exists() and self._tmp_path.stat().st_size > 0:
             # 音声を別録りしていた場合はマージしてからリネーム
             # WAVヘッダーのみ(44バイト以下)は音声データなしとみなしてスキップ
             if self._wasapi_wav_path and self._wasapi_wav_path.exists() and \
@@ -595,7 +737,7 @@ class Recorder:
                 default = get_default_loopback_device()
                 if default and default != self._audio_device:
                     self.log(f"  → ゲーム音は既定の再生デバイスから出ます。「音声録音」で次を選んでください: {default}")
-            self._rename_output()
+            self._finish_output(trim_start)
         else:
             self._show_ffmpeg_error()
             if self._tmp_path and self._tmp_path.exists():
@@ -618,9 +760,7 @@ class Recorder:
             return
 
         self.log("映像と音声をマージ中...")
-        tmp_fd, tmp_str = tempfile.mkstemp(suffix="_merged.mp4", dir=self._final_path.parent)
-        import os; os.close(tmp_fd)
-        merged = Path(tmp_str)
+        merged = self._final_path.with_name(self._final_path.stem + ".merging.mkv")
 
         # 映像開始から音声キャプチャ開始までのズレを補正
         offset_ms = max(0, int((self._audio_start_time - self._video_start_time) * 1000))
@@ -665,23 +805,52 @@ class Recorder:
             self.log(f"[警告] マージエラー: {e}、映像のみで保存します")
             merged.unlink(missing_ok=True)
 
-    def _rename_output(self) -> None:
+    def _finish_output(self, trim_start: float = 0.0) -> None:
+        """録画用の MKV を MP4 に仕上げて出力ファイルに置く (無変換なので一瞬で終わる)。"""
         if not self._tmp_path or not self._final_path:
             return
         if not self._tmp_path.exists():
             self.log("[警告] 録画ファイルが見つかりません")
             return
+        import os
+        ffmpeg = find_ffmpeg()
+        finishing = self._final_path.with_name(self._final_path.stem + ".finishing.mp4")
+        cmd = [ffmpeg, "-y"]
+        if trim_start > 0:
+            # -i の前の -ss は直前のキーフレームから取り込み、指定位置から再生されるようにする
+            cmd += ["-ss", f"{trim_start:.3f}"]
+            self.log(f"冒頭 {trim_start:.1f} 秒をカットします")
+        cmd += ["-i", str(self._tmp_path), "-c", "copy", "-movflags", "+faststart", str(finishing)]
+
+        CREATE_NO_WINDOW = 0x08000000
         try:
-            import os
-            os.replace(str(self._tmp_path), str(self._final_path))
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW, timeout=600,
+            )
+            ok = result.returncode == 0 and finishing.exists() and finishing.stat().st_size > 0
+            err = "" if ok else next(
+                (l.strip() for l in reversed(result.stderr.splitlines()) if l.strip()), "不明なエラー")
+        except Exception as e:
+            ok, err = False, str(e)
+
+        if not ok:
+            finishing.unlink(missing_ok=True)
+            self.log(f"[警告] MP4 への仕上げに失敗しました ({err})")
+            self.log(f"  → 録画は MKV のまま残しています: {self._tmp_path}")
+            return
+        try:
+            os.replace(str(finishing), str(self._final_path))
+            self._tmp_path.unlink(missing_ok=True)
             self.log(f"保存完了: {self._final_path}")
         except PermissionError:
             self.log(f"[警告] 上書き失敗: {self._final_path.name} が別のアプリで開かれています")
             self.log(f"  → そのアプリを閉じてから一時ファイルを手動でリネームしてください")
-            self.log(f"  → 一時ファイル: {self._tmp_path}")
+            self.log(f"  → 一時ファイル: {finishing}")
+            self._tmp_path.unlink(missing_ok=True)
         except Exception as e:
             self.log(f"[警告] リネーム失敗: {e}")
-            self.log(f"一時ファイルとして保存されています: {self._tmp_path}")
+            self.log(f"一時ファイルとして保存されています: {finishing}")
 
     def _show_ffmpeg_error(self) -> None:
         if not self._stderr_path or not self._stderr_path.exists():

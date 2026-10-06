@@ -11,6 +11,7 @@ import customtkinter as ctk
 
 import config as cfg_mod
 import game
+import process_audio
 import recorder as rec_mod
 import rep_parser
 
@@ -21,8 +22,8 @@ except ImportError:
     _DND_AVAILABLE = False
 
 APP_TITLE = "非想天則 リプレイ録画ツール"
-APP_VERSION = "1.1.0"
-WIDTH, HEIGHT = 620, 920
+APP_VERSION = "1.2.0"
+WIDTH, HEIGHT = 620, 900
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -45,12 +46,41 @@ _PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "s
 # ──────────────────────────────────────────────
 # ワーカースレッド
 # ──────────────────────────────────────────────
+class GameContext:
+    """
+    バッチ録画の間、起動したままのゲームを次のリプレイへ引き継ぐための入れ物。
+    リプレイが終わるとゲームはリプレイ一覧に戻るので、一時ファイルを差し替えて
+    決定キーを押すだけで次を再生できる。毎回ゲームを起動し直す必要がない。
+    """
+
+    def __init__(self):
+        self.proc = None                  # 起動中のゲーム (無ければ None)
+        self.hwnd: int | None = None
+        self.vb_name: str | None = None   # ゲーム音のみモードで音を流している VB-Cable の再生デバイス名
+
+
 class RecordSession:
-    def __init__(self, cfg: dict, rep_path: str, output_path: str, log_q: queue.Queue):
+    def __init__(
+        self,
+        cfg: dict,
+        rep_path: str,
+        output_path: str,
+        log_q: queue.Queue,
+        game_ctx: GameContext | None = None,
+        keep_game: bool = False,
+    ):
         self.cfg = cfg
         self.rep_path = rep_path
         self.output_path = output_path
         self.log_q = log_q
+        self._ctx = game_ctx or GameContext()
+        self._keep_game = keep_game       # 録画後もゲームを閉じずに次のリプレイへ引き継ぐか
+        self._replay_finished = False     # リプレイが最後まで再生されて一覧に戻ったか
+        self._battle_time: float | None = None   # 対戦画面に切り替わった時刻 (冒頭カット用)
+        self._load_time: float | None = None     # リプレイのロードが始まった時刻
+        self._recording_started = False
+        self._early_record = False               # メニュー操作の前から録画を始めたか
+        self._watch_done = threading.Event()     # 画面の見張りスレッドを止める合図
         self._stop_event = threading.Event()
         self._recorder = rec_mod.Recorder(log=self._log)
         self._game_proc = None
@@ -73,8 +103,10 @@ class RecordSession:
 
     def _run_inner(self) -> None:
         cfg = self.cfg
+        ctx = self._ctx
 
-        if game.is_already_running(cfg["th123_path"]):
+        reuse = ctx.proc is not None and game.is_running(ctx.proc)
+        if not reuse and game.is_already_running(cfg["th123_path"]):
             raise RuntimeError(
                 "th123.EXE がすでに起動中です。\n"
                 "先にゲームを閉じてから録画開始してください。"
@@ -92,18 +124,195 @@ class RecordSession:
         else:
             self._log("リプレイ時間を推定できませんでした (手動停止してください)")
 
-        # ── ゲーム音のみモード: 起動前に VB-Cable を既定デバイスに一時変更 ──
-        _routing_ok = False
-        _vb_name: str | None = None
-        if cfg.get("game_audio_only", False):
+        hwnd = None
+        if reuse:
+            self._game_proc = ctx.proc
+            if self._play_in_running_game(ctx.hwnd):
+                hwnd = ctx.hwnd
+            elif self._stop_event.is_set():
+                return
+            else:
+                self._log("起動中のゲームで次のリプレイを始められなかったため、ゲームを起動し直します")
+                self._recorder.stop(discard=True)
+                self._recorder = rec_mod.Recorder(log=self._log)
+                self._recording_started = self._early_record = False
+                try:
+                    self._game_proc.terminate()
+                except Exception:
+                    pass
+                ctx.proc = ctx.hwnd = None
+                time.sleep(1.5)   # プロセスが終了しきるのを待つ
+        if hwnd is None:
+            hwnd = self._launch_and_play()
+            if hwnd is None:
+                return   # 停止された
+        pid = self._game_proc.pid
+
+        self._start_recording(hwnd)   # まだ始めていなければここで開始
+
+        self._log("リプレイ再生中...")
+        deadline = (time.time() + auto_dur) if auto_dur is not None else None
+        _next_notice = time.time() + 60.0
+
+        # 画面静止によるリプレイ終了検出
+        # 試合間の暗転 (通常10-15秒) で誤発火しないよう、検出秒数を長めに取る。
+        _STATIC_SECS = 25   # この秒数以上画面が静止したらリプレイ終了と判定
+        _GRACE_SECS  = 30   # 録画開始後この秒数経つまでは静止検出しない
+        _record_start = time.time()
+        _last_pixels: list | None = None
+        _static_since: float | None = None
+        _next_sample = 0.0
+        _seen_battle = False    # 対戦画面に入ったのを確認済みか (シーン遷移による終了検出用)
+
+        while True:
+            if self._stop_event.is_set():
+                self._log("停止を受け付けました")
+                break
+            if not game.is_running(self._game_proc):
+                self._log("ゲームが終了しました")
+                break
+            now = time.time()
+            if deadline is not None and now >= deadline:
+                self._log("自動停止: 推定再生時間を超えました")
+                break
+
+            # 対戦画面を抜けた (リプレイメニューに戻った) らリプレイ終了。
+            # 画面静止検出より正確で、終了後のメニュー画面が動画に残らない。
+            scene = game.read_scene(pid)
+            if scene is not None:
+                # 片方だけ変わった時点はまだ暗転中。両方変わるまで待って暗転も録る
+                if game.SCENE_BATTLE in scene:
+                    if scene[0] == scene[1]:
+                        _seen_battle = True
+                elif _seen_battle and cfg.get("auto_stop", True):
+                    self._log("リプレイ終了を検出しました")
+                    self._replay_finished = True
+                    break
+
+            elapsed = now - _record_start
+            if elapsed >= _GRACE_SECS and cfg.get("auto_stop", True) and now >= _next_sample:
+                _next_sample = now + 0.5
+                pixels = game.sample_window_pixels(self._hwnd)
+                if pixels is not None:
+                    if _last_pixels is not None:
+                        changed = sum(p != q for p, q in zip(pixels, _last_pixels))
+                        if changed <= 2:                # ほぼ変化なし = 静止
+                            if _static_since is None:
+                                _static_since = now
+                            elif now - _static_since >= _STATIC_SECS:
+                                self._log("リプレイ終了を検出しました (画面静止)")
+                                break
+                        else:
+                            _static_since = None        # 動いていたのでリセット
+                    _last_pixels = pixels
+
+            if deadline is not None and now >= _next_notice:
+                remaining = int(deadline - now)
+                rm, rs = divmod(remaining, 60)
+                self._log(f"[自動停止まで残り {rm}分{rs:02d}秒]")
+                _next_notice = now + 60.0
+            time.sleep(0.1)
+
+    def _start_recording(self, hwnd: int, early: bool = False) -> None:
+        """
+        録画を開始する (開始済みなら何もしない)。
+        early=True はリプレイを再生する操作の前に呼ぶ場合。録画の立ち上がりには 1 秒近く
+        かかるので、再生が始まってから録画を始めると試合の頭が欠けることがある。
+        先に録り始めておき、余分な部分 (メニューやロード画面) は仕上げでカットする。
+        """
+        if self._recording_started:
+            return
+        cfg = self.cfg
+        audio_dev = cfg.get("audio_device", "なし(無音)")
+        # ゲーム音のみモード: ルーティング成功時のみ VB-Cable ループバックを自動選択
+        if cfg.get("game_audio_only", False) and self._ctx.vb_name:
+            try:
+                import audio_routing
+                vb_lb = audio_routing.find_vbcable_loopback_name(self._ctx.vb_name)
+                if vb_lb:
+                    audio_dev = vb_lb
+                    self._log(f"[ゲーム音のみ] 音声キャプチャ: {vb_lb}")
+            except Exception:
+                pass
+        audio_dev_arg = None if audio_dev == "なし(無音)" else audio_dev
+        audio_pid = None
+        if cfg.get("game_audio_only", False) and process_audio.is_supported():
+            audio_pid = self._game_proc.pid
+
+        self._hwnd = hwnd
+        self._recording_started = True
+        self._early_record = early
+        self._recorder.start(
+            hwnd=hwnd,
+            output_path=self.output_path,
+            framerate=cfg["framerate"],
+            crf=cfg["crf"],
+            preset=cfg["preset"],
+            audio_device=audio_dev_arg,
+            audio_pid=audio_pid,
+        )
+        self._log("録画中 (ウィンドウ単位でキャプチャしています。最小化しなければ他の作業をしても問題ありません)")
+        threading.Thread(target=self._watch_scene_times, daemon=True).start()
+
+    def _watch_scene_times(self) -> None:
+        """
+        ロード画面・対戦画面に切り替わった時刻を記録する (冒頭カットの位置になる)。
+        キー操作の最中に切り替わることがあるので、操作とは別のスレッドで見張る。
+        操作が終わってから調べ始めると検出が遅れ、試合の頭までカットしてしまう。
+        """
+        pid = self._game_proc.pid
+        while self._battle_time is None and not self._watch_done.is_set():
+            scene = game.read_scene(pid)
+            if scene is None:
+                return
+            now = time.time()
+            if scene == (game.SCENE_LOADING, game.SCENE_LOADING) and self._load_time is None:
+                self._load_time = now
+            elif scene == (game.SCENE_BATTLE, game.SCENE_BATTLE):
+                if self._load_time is None:
+                    self._load_time = now
+                self._battle_time = now
+            time.sleep(0.03)
+
+    def _play_in_running_game(self, hwnd: int) -> bool:
+        """
+        起動したままのゲームで次のリプレイを再生する。
+        前のリプレイが終わってリプレイ一覧に戻っており、カーソルは一時ファイルに
+        合ったままなので、(差し替え済みのファイルに対して) 決定キーを押すだけでよい。
+        """
+        pid = self._game_proc.pid
+        if game.wait_for_scene(pid, (game.SCENE_TITLE,), timeout=10.0,
+                               should_stop=self._stop_event.is_set) is not True:
+            return False
+        time.sleep(1.0)   # 一覧に戻った直後は入力を受け付けないため少し待つ
+        self._log("ゲームを起動したまま次のリプレイを再生します")
+        self._start_recording(hwnd, early=True)
+        for _ in range(3):
+            if self._stop_event.is_set():
+                return False
+            game.send_confirm(hwnd)
+            if game.wait_for_scene(pid, (game.SCENE_LOADING, game.SCENE_BATTLE), timeout=3.0,
+                                   should_stop=self._stop_event.is_set) is True:
+                return True
+        return False
+
+    def _launch_and_play(self) -> int | None:
+        """ゲームを起動し、メニューを操作してリプレイを再生する。停止されたら None。"""
+        cfg = self.cfg
+        ctx = self._ctx
+
+        # ── ゲーム音のみモード ──
+        # Windows 10 (2004) 以降はゲームのプロセスの音だけを直接録れるので何もしなくてよい。
+        # それより古い Windows では、起動前に VB-Cable を既定デバイスに一時変更して音を分ける。
+        ctx.vb_name = None
+        if cfg.get("game_audio_only", False) and not process_audio.is_supported():
             try:
                 import audio_routing
                 vb = audio_routing.find_vbcable()
                 if vb:
                     self._prev_default_device = audio_routing.get_default_playback_device_id()
                     if audio_routing.set_default_playback_device(vb[1]):
-                        _routing_ok = True
-                        _vb_name = vb[0]
+                        ctx.vb_name = vb[0]
                         self._log(f"[ゲーム音のみ] 既定デバイスを「{vb[0]}」に変更しました")
                     else:
                         self._log("[警告] 既定デバイスの変更に失敗しました (通常ルーティングで続行)")
@@ -140,7 +349,7 @@ class RecordSession:
             should_stop=self._stop_event.is_set,
         )
         if self._stop_event.is_set():
-            return
+            return None
         if reached:
             time.sleep(1.0)   # タイトル表示直後は入力を受け付けないため少し待つ
         else:
@@ -151,11 +360,15 @@ class RecordSession:
                 self._log("[警告] タイトル画面への到達を確認できませんでした (そのまま続行)")
             for _ in range(int(wait * 2)):
                 if self._stop_event.is_set():
-                    return
+                    return None
                 time.sleep(0.5)
 
         if self._stop_event.is_set():
-            return
+            return None
+
+        # 画面状態が読める場合だけ先に録画を始める (読めないと余分な部分をカットできない)
+        if reached:
+            self._start_recording(hwnd, early=True)
 
         game.send_key_sequence(
             hwnd,
@@ -172,98 +385,13 @@ class RecordSession:
                 should_stop=self._stop_event.is_set,
             )
             if self._stop_event.is_set():
-                return
+                return None
             if playing is False:
                 raise RuntimeError(
                     "リプレイ再生を開始できませんでした。\n"
                     "「メニュー↓回数」「選択後Z回数」を確認してください。"
                 )
-
-        audio_dev = cfg.get("audio_device", "なし(無音)")
-        # ゲーム音のみモード: ルーティング成功時のみ VB-Cable ループバックを自動選択
-        if cfg.get("game_audio_only", False) and _routing_ok:
-            try:
-                import audio_routing
-                vb_lb = audio_routing.find_vbcable_loopback_name(_vb_name)
-                if vb_lb:
-                    audio_dev = vb_lb
-                    self._log(f"[ゲーム音のみ] 音声キャプチャ: {vb_lb}")
-            except Exception:
-                pass
-        audio_dev_arg = None if audio_dev == "なし(無音)" else audio_dev
-
-        self._hwnd = hwnd
-        self._recorder.start(
-            hwnd=hwnd,
-            output_path=self.output_path,
-            framerate=cfg["framerate"],
-            crf=cfg["crf"],
-            preset=cfg["preset"],
-            audio_device=audio_dev_arg,
-        )
-        self._log("録画中 (ウィンドウ単位でキャプチャしています。最小化しなければ他の作業をしても問題ありません)")
-
-        self._log("リプレイ再生中...")
-        deadline = (time.time() + auto_dur) if auto_dur is not None else None
-        _next_notice = time.time() + 60.0
-
-        # 画面静止によるリプレイ終了検出
-        # 試合間の暗転 (通常10-15秒) で誤発火しないよう、検出秒数を長めに取る。
-        _STATIC_SECS = 25   # この秒数以上画面が静止したらリプレイ終了と判定
-        _GRACE_SECS  = 30   # 録画開始後この秒数経つまでは静止検出しない
-        _record_start = time.time()
-        _last_pixels: list | None = None
-        _static_since: float | None = None
-        _next_sample = 0.0
-        _seen_battle = False    # 対戦画面に入ったのを確認済みか (シーン遷移による終了検出用)
-
-        while True:
-            if self._stop_event.is_set():
-                self._log("停止を受け付けました")
-                break
-            if not game.is_running(self._game_proc):
-                self._log("ゲームが終了しました")
-                break
-            now = time.time()
-            if deadline is not None and now >= deadline:
-                self._log("自動停止: 推定再生時間を超えました")
-                break
-
-            # 対戦画面を抜けた (リプレイメニューに戻った) らリプレイ終了。
-            # 画面静止検出より正確で、終了後のメニュー画面が動画に残らない。
-            if cfg.get("auto_stop", True):
-                scene = game.read_scene(pid)
-                if scene is not None:
-                    # 片方だけ変わった時点はまだ暗転中。両方変わるまで待って暗転も録る
-                    if game.SCENE_BATTLE in scene:
-                        _seen_battle = _seen_battle or scene[0] == scene[1]
-                    elif _seen_battle:
-                        self._log("リプレイ終了を検出しました")
-                        break
-
-            elapsed = now - _record_start
-            if elapsed >= _GRACE_SECS and cfg.get("auto_stop", True) and now >= _next_sample:
-                _next_sample = now + 0.5
-                pixels = game.sample_window_pixels(self._hwnd)
-                if pixels is not None:
-                    if _last_pixels is not None:
-                        changed = sum(p != q for p, q in zip(pixels, _last_pixels))
-                        if changed <= 2:                # ほぼ変化なし = 静止
-                            if _static_since is None:
-                                _static_since = now
-                            elif now - _static_since >= _STATIC_SECS:
-                                self._log("リプレイ終了を検出しました (画面静止)")
-                                break
-                        else:
-                            _static_since = None        # 動いていたのでリセット
-                    _last_pixels = pixels
-
-            if deadline is not None and now >= _next_notice:
-                remaining = int(deadline - now)
-                rm, rs = divmod(remaining, 60)
-                self._log(f"[自動停止まで残り {rm}分{rs:02d}秒]")
-                _next_notice = now + 60.0
-            time.sleep(0.1)
+        return hwnd
 
     def _restore_default_device(self) -> None:
         prev, self._prev_default_device = self._prev_default_device, None
@@ -280,14 +408,43 @@ class RecordSession:
 
     def _cleanup(self) -> None:
         self._restore_default_device()
-        self._recorder.stop()
-        if self._game_proc and game.is_running(self._game_proc):
-            try:
-                self._game_proc.terminate()
-            except Exception:
-                pass
-        if hasattr(self, "_rep_dest"):
-            game.remove_rep_from_game(self._rep_dest)
+
+        self._watch_done.set()
+
+        # 動画の冒頭から余分な部分を落とす。
+        #   ロード画面カット ON : 対戦画面に切り替わったところから
+        #   OFF               : ロード画面が出たところから (先に録り始めたメニュー操作だけ落とす)
+        # 頭が欠けないよう、検出した時刻の少し手前で切る。
+        start = self._recorder.video_start_time
+        trim_start = 0.0
+        if self.cfg.get("trim_loading", True) and self._battle_time:
+            trim_start = self._battle_time - start - 0.2
+        elif self._early_record and self._load_time:
+            trim_start = self._load_time - start - 0.2
+        # 先に録り始めたのにリプレイを再生できなかった場合、映っているのはメニューだけなので捨てる
+        discard = self._early_record and self._load_time is None
+        if self._load_time and self._battle_time:
+            self._log(f"[診断] 録画開始から ロード開始 {self._load_time - start:.1f}秒 / "
+                      f"対戦開始 {self._battle_time - start:.1f}秒")
+        self._recorder.stop(trim_start=max(0.0, trim_start), discard=discard)
+
+        # 次のリプレイが控えていて、今のリプレイが最後まで再生されて一覧に戻っているなら、
+        # ゲームは閉じずに引き継ぐ (一時ファイルも次の差し替えまで残す)。
+        # 途中で止めた・エラーになった場合は画面の状態が分からないので閉じる。
+        ctx = self._ctx
+        running = self._game_proc is not None and game.is_running(self._game_proc)
+        if (self._keep_game and self._replay_finished and running
+                and not self._stop_event.is_set()):
+            ctx.proc, ctx.hwnd = self._game_proc, self._hwnd
+        else:
+            if running:
+                try:
+                    self._game_proc.terminate()
+                except Exception:
+                    pass
+            ctx.proc = ctx.hwnd = None
+            if hasattr(self, "_rep_dest"):
+                game.remove_rep_from_game(self._rep_dest)
         if Path(self.output_path).exists():
             size_mb = Path(self.output_path).stat().st_size / 1024 / 1024
             self._log(f"保存完了: {Path(self.output_path).name}  ({size_mb:.1f} MB)")
@@ -369,12 +526,14 @@ class App(ctk.CTk):
 
         btn_col = ctk.CTkFrame(frame_rep, fg_color="transparent")
         btn_col.grid(row=0, column=2, padx=6, pady=4, sticky="n")
-        ctk.CTkButton(btn_col, text="追加", width=60, command=self._add_rep).pack(pady=2)
-        ctk.CTkButton(btn_col, text="削除", width=60, command=self._remove_rep).pack(pady=2)
-        ctk.CTkButton(btn_col, text="全削除", width=60, command=self._clear_rep).pack(pady=2)
-        ctk.CTkButton(btn_col, text="↑", width=60, command=self._move_rep_up).pack(pady=2)
-        ctk.CTkButton(btn_col, text="↓", width=60, command=self._move_rep_down).pack(pady=2)
-        ctk.CTkButton(btn_col, text="スキャン", width=60, command=self._scan_replay_folder).pack(pady=(6, 2))
+        for i, (text, command) in enumerate([
+            ("追加", self._add_rep),     ("↑", self._move_rep_up),
+            ("削除", self._remove_rep),  ("↓", self._move_rep_down),
+            ("全削除", self._clear_rep), ("スキャン", self._scan_replay_folder),
+        ]):
+            ctk.CTkButton(btn_col, text=text, width=60, command=command).grid(
+                row=i // 2, column=i % 2, padx=2, pady=2
+            )
 
         # ── 出力フォルダ ──
         frame_out = ctk.CTkFrame(self)
@@ -456,19 +615,29 @@ class App(ctk.CTk):
             variable=self._auto_stop_var,
         ).grid(row=7, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 2))
 
+        # ── 冒頭のロード画面カット ──
+        self._trim_loading_var = tk.BooleanVar(value=self._cfg.get("trim_loading", True))
+        ctk.CTkCheckBox(
+            detail,
+            text="動画の冒頭のロード画面をカットする",
+            variable=self._trim_loading_var,
+        ).grid(row=11, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
+
         # ── ゲーム音のみ ──
         self._game_audio_only_var = tk.BooleanVar(value=self._cfg.get("game_audio_only", False))
         ctk.CTkCheckBox(
             detail,
-            text="ゲーム音のみ録音（ゲーム起動時に既定デバイスを一時変更）",
+            text="ゲーム音のみ録音（他のアプリの音を入れない）",
             variable=self._game_audio_only_var,
         ).grid(row=8, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 0))
 
+        # VB-Cable が要るのは、プロセス単位の録音ができない古い Windows だけ
         _vb_hint_row = ctk.CTkFrame(detail, fg_color="transparent")
-        _vb_hint_row.grid(row=9, column=0, columnspan=6, sticky="w", padx=(28, 8), pady=(0, 4))
+        if not process_audio.is_supported():
+            _vb_hint_row.grid(row=9, column=0, columnspan=6, sticky="w", padx=(28, 8), pady=(0, 4))
         ctk.CTkLabel(
             _vb_hint_row,
-            text="※ この機能を使うには VB-Cable のインストールが必要です",
+            text="※ この Windows では VB-Cable のインストールが必要です",
             font=ctk.CTkFont(size=10),
             text_color="#e0a020",
         ).pack(side="left")
@@ -518,33 +687,28 @@ class App(ctk.CTk):
             variable=self._auto_trim_var,
         ).pack()
 
+        # ── 切り抜き / 結合 / プレビュー ── (下端に固定し、残りの高さをログに使う)
+        tool_row = ctk.CTkFrame(self, fg_color="transparent")
+        tool_row.pack(side="bottom", pady=(0, 12))
+        for text, command in [
+            ("録画を切り抜く", self._open_trim_last),
+            ("ファイルを切り抜く", self._open_trim_browse),
+            ("動画を結合", self._open_concat_window),
+            ("キャプチャ確認", self._show_capture_preview),
+        ]:
+            ctk.CTkButton(tool_row, text=text, width=138, height=34, command=command).pack(side="left", padx=4)
+
         # ── ログ ──
         ctk.CTkLabel(self, text="ログ").pack(anchor="w", padx=14)
-        self._log_box = ctk.CTkTextbox(self, height=160, state="disabled")
-        self._log_box.pack(fill="x", padx=12, pady=(2, 8))
+        self._log_box = ctk.CTkTextbox(self, height=100, state="disabled")
+        self._log_box.pack(fill="both", expand=True, padx=12, pady=(2, 8))
 
-        # ── 切り抜き / 結合 / プレビュー ──
-        trim_row = ctk.CTkFrame(self, fg_color="transparent")
-        trim_row.pack(pady=(0, 4))
-        ctk.CTkButton(
-            trim_row, text="録画ファイルを切り抜く", width=180, height=36,
-            command=self._open_trim_last,
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
-            trim_row, text="ファイルを指定して切り抜く", width=200, height=36,
-            command=self._open_trim_browse,
-        ).pack(side="left", padx=6)
-
-        tool_row = ctk.CTkFrame(self, fg_color="transparent")
-        tool_row.pack(pady=(0, 12))
-        ctk.CTkButton(
-            tool_row, text="動画を結合", width=180, height=36,
-            command=self._open_concat_window,
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
-            tool_row, text="キャプチャ確認", width=160, height=36,
-            command=self._show_capture_preview,
-        ).pack(side="left", padx=6)
+        # 中身が収まる高さにする。画面が小さければ画面に合わせ、足りない分はログ欄が縮む
+        self.update_idletasks()
+        scale = ctk.ScalingTracker.get_window_scaling(self)
+        needed = int(self.winfo_reqheight() / scale) + 60    # ログ欄に少し余裕を足す
+        fits = int(self.winfo_screenheight() / scale) - 110  # タイトルバーとタスクバーの分
+        self.geometry(f"{WIDTH}x{max(600, min(needed, fits))}")
 
     # ── ドラッグ&ドロップ ────────────────────
     def _on_dnd_drop(self, event) -> None:
@@ -690,6 +854,7 @@ class App(ctk.CTk):
         cfg["auto_open_trim"] = self._auto_trim_var.get()
         cfg["auto_stop"] = self._auto_stop_var.get()
         cfg["game_audio_only"] = self._game_audio_only_var.get()
+        cfg["trim_loading"] = self._trim_loading_var.get()
         cfg["filename_template"] = self._template_var.get().strip() or "{stem}"
         for key, var in self._detail_vars.items():
             try:
@@ -753,6 +918,7 @@ class App(ctk.CTk):
         self._batch_total = len(self._rep_files)
         self._batch_index = 0
         self._batch_stopped = False
+        self._game_ctx = GameContext()
 
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
@@ -778,7 +944,11 @@ class App(ctk.CTk):
         output_path = self._resolve_output_path(cfg, rep_path)
 
         self._log(f"\n[{self._batch_index + 1}/{self._batch_total}] {Path(rep_path).name}")
-        self._session = RecordSession(cfg, rep_path, output_path, self._log_queue)
+        self._session = RecordSession(
+            cfg, rep_path, output_path, self._log_queue,
+            game_ctx=self._game_ctx,
+            keep_game=self._batch_index < self._batch_total - 1,
+        )
         threading.Thread(target=self._session.run, daemon=True).start()
 
     def _stop_recording(self) -> None:

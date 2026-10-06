@@ -67,6 +67,7 @@ def main() -> None:
         "--hidden-import", "win32com.shell.shellcon",
         "--hidden-import", "win32event",
         "--hidden-import", "audio_routing",
+        "--hidden-import", "process_audio",
         "--hidden-import", "cv2",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",

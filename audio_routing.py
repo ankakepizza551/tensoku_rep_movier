@@ -18,7 +18,11 @@ _COINIT_MULTITHREADED = 0
 _COM_INIT_OK = {0, 1, -2147417850}   # S_OK, S_FALSE, RPC_E_CHANGED_MODE
 
 def _com_init() -> None:
-    _ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)
+    try:
+        _ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)
+    except OSError:
+        # このスレッドは別のモードで初期化済み (GUI スレッド等)。そのまま使えるので問題ない
+        pass
 
 
 # ── GUID / COM ヘルパー ────────────────────────────────────────────

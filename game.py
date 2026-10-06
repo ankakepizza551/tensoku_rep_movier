@@ -376,6 +376,11 @@ def _send_key_with_verify(
             log(f"  → 警告: 画面変化が検出できませんでした")
 
 
+def send_confirm(hwnd: int) -> None:
+    """決定キー (Z) を 1 回送る。"""
+    _send_key(hwnd, VK_Z)
+
+
 def send_key_sequence(
     hwnd: int,
     down_count: int,
