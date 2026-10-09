@@ -51,6 +51,8 @@ python main.py
 | ↓ 回数 | タイトルからリプレイメニューへの↓キー回数 | 6 |
 | Z 回数 | リプレイ選択・開始のZキー回数 | 4 |
 
+「Soku Advisor 用のライブ記録も保存」を ON にすると、動画と同じ名前の `.json` を同じフォルダに保存します。[Soku Advisor](https://github.com/ankakepizza551/soku-advisor) (v1.9 以降) でこの `.json` を選ぶと、同じ名前の動画を自動で組にしてレポートを作れます。記録の処理は Soku Advisor の `soku_live_reader.py` をそのまま同梱しています。
+
 ## 注意
 
 - ゲームのリプレイフォルダ内に `!` フォルダを作り、その中に一時ファイルを作成します  

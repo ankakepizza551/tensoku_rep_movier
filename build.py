@@ -68,6 +68,7 @@ def main() -> None:
         "--hidden-import", "win32event",
         "--hidden-import", "audio_routing",
         "--hidden-import", "process_audio",
+        "--hidden-import", "soku_live_reader",
         "--hidden-import", "cv2",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",

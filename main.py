@@ -22,7 +22,7 @@ except ImportError:
     _DND_AVAILABLE = False
 
 APP_TITLE = "非想天則 リプレイ録画ツール"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 WIDTH, HEIGHT = 620, 900
 
 ctk.set_appearance_mode("dark")
@@ -85,6 +85,9 @@ class RecordSession:
         self._recorder = rec_mod.Recorder(log=self._log)
         self._game_proc = None
         self._prev_default_device: str | None = None   # ゲーム音のみモードで退避した既定デバイス
+        self._live = None                              # Soku Advisor 用のライブ記録 (取らない時は None)
+        self._live_thread: threading.Thread | None = None
+        self._live_done = threading.Event()
 
     def _log(self, msg: str) -> None:
         self.log_q.put(msg)
@@ -136,6 +139,7 @@ class RecordSession:
                 self._recorder.stop(discard=True)
                 self._recorder = rec_mod.Recorder(log=self._log)
                 self._recording_started = self._early_record = False
+                self._stop_live_record(save=False)
                 try:
                     self._game_proc.terminate()
                 except Exception:
@@ -253,6 +257,57 @@ class RecordSession:
         )
         self._log("録画中 (ウィンドウ単位でキャプチャしています。最小化しなければ他の作業をしても問題ありません)")
         threading.Thread(target=self._watch_scene_times, daemon=True).start()
+        self._start_live_record()
+
+    def _start_live_record(self) -> None:
+        """
+        Soku Advisor 用のライブ記録を取り始める (設定が ON の時だけ)。
+        動画と同じ名前の .json に保存するので、Soku Advisor が動画と組にして読める。
+        記録は対戦画面の間だけ進むので、リプレイを再生する前から始めておいてよい。
+        """
+        if not self.cfg.get("save_live_json", False) or self._live_thread is not None:
+            return
+        import soku_live_reader
+        live = soku_live_reader.LiveRecorder(Path(self.output_path).with_suffix(".json"))
+        if not live.connect():
+            self._log("[ライブ記録] ゲームのメモリを読めなかったため、ライブ記録は保存しません")
+            return
+        self._live = live
+        self._live_done.clear()
+
+        def _loop() -> None:
+            interval = 1.0 / 60.0
+            while not self._live_done.is_set():
+                t0 = time.perf_counter()
+                if not live.record_frame():
+                    break       # ゲームが終了した
+                rest = interval - (time.perf_counter() - t0)
+                if rest > 0:
+                    time.sleep(rest)
+
+        self._live_thread = threading.Thread(target=_loop, daemon=True)
+        self._live_thread.start()
+
+    def _stop_live_record(self, save: bool) -> None:
+        """ライブ記録を止める。save=True で、記録があれば動画と同じ名前の .json に保存する。"""
+        live, thread = self._live, self._live_thread
+        self._live = self._live_thread = None
+        if live is None:
+            return
+        self._live_done.set()
+        if thread is not None:
+            thread.join(timeout=2.0)
+        try:
+            if save and live.frames:
+                live.save()
+                self._log(f"ライブ記録を保存: {live.output_path.name}  ({live.frame_count} フレーム)")
+            elif save:
+                self._log("[ライブ記録] 対戦画面を記録できなかったため、保存しませんでした")
+        except Exception as e:
+            self._log(f"[ライブ記録] 保存に失敗しました: {e}")
+        finally:
+            import soku_live_reader
+            soku_live_reader.close_process_handle(live.proc)
 
     def _watch_scene_times(self) -> None:
         """
@@ -427,6 +482,8 @@ class RecordSession:
             self._log(f"[診断] 録画開始から ロード開始 {self._load_time - start:.1f}秒 / "
                       f"対戦開始 {self._battle_time - start:.1f}秒")
         self._recorder.stop(trim_start=max(0.0, trim_start), discard=discard)
+        # ゲームを閉じる前に止める。動画を捨てた時はライブ記録も残さない
+        self._stop_live_record(save=not discard)
 
         # 次のリプレイが控えていて、今のリプレイが最後まで再生されて一覧に戻っているなら、
         # ゲームは閉じずに引き継ぐ (一時ファイルも次の差し替えまで残す)。
@@ -621,7 +678,15 @@ class App(ctk.CTk):
             detail,
             text="動画の冒頭のロード画面をカットする",
             variable=self._trim_loading_var,
-        ).grid(row=11, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=11, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 0))
+
+        # ── Soku Advisor 用のライブ記録 ──
+        self._save_live_var = tk.BooleanVar(value=self._cfg.get("save_live_json", False))
+        ctk.CTkCheckBox(
+            detail,
+            text="Soku Advisor 用のライブ記録 (.json) も動画と同じ名前で保存する",
+            variable=self._save_live_var,
+        ).grid(row=12, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 6))
 
         # ── ゲーム音のみ ──
         self._game_audio_only_var = tk.BooleanVar(value=self._cfg.get("game_audio_only", False))
@@ -855,6 +920,7 @@ class App(ctk.CTk):
         cfg["auto_stop"] = self._auto_stop_var.get()
         cfg["game_audio_only"] = self._game_audio_only_var.get()
         cfg["trim_loading"] = self._trim_loading_var.get()
+        cfg["save_live_json"] = self._save_live_var.get()
         cfg["filename_template"] = self._template_var.get().strip() or "{stem}"
         for key, var in self._detail_vars.items():
             try:

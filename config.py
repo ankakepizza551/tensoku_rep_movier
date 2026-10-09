@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "auto_stop": True,
     "game_audio_only": False,
     "trim_loading": True,       # 動画の冒頭のロード画面をカットする
+    "save_live_json": False,    # Soku Advisor 用のライブ記録 (.json) を動画と一緒に保存する
     "filename_template": "{stem}",
 }
 
